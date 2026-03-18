@@ -1,23 +1,39 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
-import Database from "better-sqlite3";
+import pkg from 'pg';
+const { Pool } = pkg;
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
 
-const db = new Database("database.db");
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
 const JWT_SECRET = process.env.JWT_SECRET || "finmo-secret-key";
 
 // Initialize database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    picture TEXT
-  )
-`);
+const initDb = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        picture TEXT
+      )
+    `);
+    console.log("Database initialized successfully");
+  } catch (err) {
+    console.error("Error initializing database:", err);
+  }
+};
+
+initDb();
 
 async function startServer() {
   const app = express();
@@ -35,16 +51,20 @@ async function startServer() {
 
     try {
       const hashedPassword = await bcrypt.hash(password, 10);
-      const stmt = db.prepare("INSERT INTO users (username, password) VALUES (?, ?)");
-      const result = stmt.run(username, hashedPassword);
+      const result = await pool.query(
+        "INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id",
+        [username, hashedPassword]
+      );
       
-      const token = jwt.sign({ id: result.lastInsertRowid, username }, JWT_SECRET);
+      const userId = result.rows[0].id;
+      const token = jwt.sign({ id: userId, username }, JWT_SECRET);
       res.cookie("token", token, { httpOnly: true, secure: true, sameSite: "none" });
-      res.json({ user: { id: result.lastInsertRowid, username } });
+      res.json({ user: { id: userId, username } });
     } catch (error: any) {
-      if (error.code === "SQLITE_CONSTRAINT") {
+      if (error.code === "23505") { // PostgreSQL unique violation code
         res.status(400).json({ error: "Este nome de usuário já está em uso" });
       } else {
+        console.error("Signup error:", error);
         res.status(500).json({ error: "Erro ao criar conta" });
       }
     }
@@ -52,15 +72,21 @@ async function startServer() {
 
   app.post("/api/auth/login", async (req, res) => {
     const { username, password } = req.body;
-    const user: any = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
+    try {
+      const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
+      const user = result.rows[0];
 
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-      return res.status(401).json({ error: "Usuário ou senha inválidos" });
+      if (!user || !(await bcrypt.compare(password, user.password))) {
+        return res.status(401).json({ error: "Usuário ou senha inválidos" });
+      }
+
+      const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
+      res.cookie("token", token, { httpOnly: true, secure: true, sameSite: "none" });
+      res.json({ user: { id: user.id, username: user.username } });
+    } catch (error) {
+      console.error("Login error:", error);
+      res.status(500).json({ error: "Erro ao fazer login" });
     }
-
-    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
-    res.cookie("token", token, { httpOnly: true, secure: true, sameSite: "none" });
-    res.json({ user: { id: user.id, username: user.username } });
   });
 
   app.get("/api/auth/me", (req, res) => {
